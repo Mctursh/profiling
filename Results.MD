@@ -11,4 +11,8 @@ Apple Silicon Mac, macOS 15.5, release + debug symbols, blake3 1.8.7. Defaults: 
 | 005 | 11-01 | `--account-size 16384` (NEON on by default) | 24,034 | 3.16 | 41.2ms | 61.3ms | Hashing 96% of worker; NEON `hash_many` in use. |
 | 006 | 11-01 | 005 + blake3 `no_neon` | 16,682 | 2.19 | 60.2ms | 62.8ms | NEON ≈ 1.44× faster, only for large accounts. |
 
-GB/s = tx/s × 8 × (32 + account size). Next: 007, allocation lesson, baseline 004.
+| 007 | 11-03 | one data buffer per tx (9 → 2 allocations), `--rate 0 --queue 1000` | ~583,000 | 1.34 | 1.70ms | 2.05ms | Freeing 12% → 4.9%, +3.5% vs 003 (predicted 1.12×); refactor added a `Vec<Hash>` alloc (0.8%). |
+
+| 008 | 11-03 | 007 + `hash_transaction` returns an iterator (no `Vec<Hash>`) | ~599,000 | 1.38 | 1.66ms | 2.04ms | Freeing now 2.9% (from 12% in 004); +6% vs 003; channel receive (17%) is now the biggest overhead. |
+
+GB/s = tx/s × 8 × (32 + account size).

@@ -176,7 +176,9 @@ fn worker(rx: Receiver<Transaction>, reports: Sender<Report>) {
     let mut checksum = 0u8; // keeps the compiler from optimizing hashing away
 
     for txn in rx {
-        checksum ^= hash_transaction(&txn)[0].as_bytes()[0];
+        for hash in hash_transaction(&txn) {
+            checksum ^= hash.as_bytes()[0]
+        }
 
         latencies.push(txn.created_at.elapsed().as_micros() as u64);
 
@@ -195,17 +197,14 @@ fn worker(rx: Receiver<Transaction>, reports: Sender<Report>) {
     std::hint::black_box(checksum);
 }
 
-fn hash_transaction(txn: &Transaction) -> Vec<blake3::Hash> {
-    let mut hash: Vec<blake3::Hash> = Vec::with_capacity(txn.accounts.len());
+fn hash_transaction(txn: &Transaction) -> impl Iterator<Item = blake3::Hash> {
     let account_size = txn.data.len() / txn.accounts.len();
-    for (i, account) in txn.accounts.iter().enumerate() {
+    (0..txn.accounts.len()).map(move |i| {
         let start = (i * account_size) as usize;
         let stop = (start + account_size) as usize;
         let data = &txn.data[start..stop];
-        hash.push(hash_account(&account.key, data));
-    }
-
-    hash
+       hash_account(&txn.accounts[i].key, data)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +366,6 @@ mod tests {
             second_hashes.push(hash_account(&account.key, &account.data));
         }
 
-        assert_eq!(first_hashes, second_hashes)
+        assert_eq!(first_hashes.collect::<Vec<blake3::Hash>>(), second_hashes)
     }
 }
