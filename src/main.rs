@@ -23,7 +23,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -40,8 +40,8 @@ struct Config {
 }
 
 impl Config {
-    fn from_args() -> Self {
-        let mut cfg = Config {
+    fn default() -> Self {
+        Config {
             seconds: 10,
             producers: 2,
             workers: 2,
@@ -49,7 +49,11 @@ impl Config {
             account_size: 256,
             rate: 20_000,
             queue: 10_000,
-        };
+        }
+    }
+
+    fn from_args() -> Self {
+        let mut cfg = Config::default();
 
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -81,12 +85,12 @@ impl Config {
 
 struct Account {
     key: [u8; 32],
-    data: Vec<u8>,
 }
 
 struct Transaction {
     created_at: Instant,
     accounts: Vec<Account>,
+    data: Vec<u8>,
 }
 
 /// What a worker reports back: how long each transaction took, from the
@@ -100,14 +104,19 @@ struct Report {
 // ---------------------------------------------------------------------------
 
 fn make_transaction(cfg: &Config, counter: u64) -> Transaction {
+    let mut txs_data: Vec<u8> = Vec::with_capacity(cfg.account_size * cfg.accounts);
     let accounts = (0..cfg.accounts)
         .map(|i| {
             let mut key = [0u8; 32];
             key[..8].copy_from_slice(&counter.to_le_bytes());
             key[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+
+            txs_data.resize(
+                txs_data.len() + cfg.account_size,
+                (counter as u8).wrapping_add(i as u8),
+            );
             Account {
                 key,
-                data: vec![(counter as u8).wrapping_add(i as u8); cfg.account_size],
             }
         })
         .collect();
@@ -115,6 +124,7 @@ fn make_transaction(cfg: &Config, counter: u64) -> Transaction {
     Transaction {
         created_at: Instant::now(),
         accounts,
+        data: txs_data,
     }
 }
 
@@ -153,10 +163,10 @@ fn producer(cfg: Config, tx: Sender<Transaction>, stop_at: Instant) {
 // Stage 2: workers
 // ---------------------------------------------------------------------------
 
-fn hash_account(account: &Account) -> blake3::Hash {
+fn hash_account(key: &[u8], data: &[u8]) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&account.key);
-    hasher.update(&account.data);
+    hasher.update(key);
+    hasher.update(data);
     hasher.finalize()
 }
 
@@ -165,10 +175,9 @@ fn worker(rx: Receiver<Transaction>, reports: Sender<Report>) {
     let mut last_flush = Instant::now();
     let mut checksum = 0u8; // keeps the compiler from optimizing hashing away
 
-    for txn in rx.iter() {
-        for account in &txn.accounts {
-            checksum ^= hash_account(account).as_bytes()[0];
-        }
+    for txn in rx {
+        checksum ^= hash_transaction(&txn)[0].as_bytes()[0];
+
         latencies.push(txn.created_at.elapsed().as_micros() as u64);
 
         // Send latencies to the reporter in batches, not one by one.
@@ -184,6 +193,19 @@ fn worker(rx: Receiver<Transaction>, reports: Sender<Report>) {
         latencies_us: latencies,
     });
     std::hint::black_box(checksum);
+}
+
+fn hash_transaction(txn: &Transaction) -> Vec<blake3::Hash> {
+    let mut hash: Vec<blake3::Hash> = Vec::with_capacity(txn.accounts.len());
+    let account_size = txn.data.len() / txn.accounts.len();
+    for (i, account) in txn.accounts.iter().enumerate() {
+        let start = (i * account_size) as usize;
+        let stop = (start + account_size) as usize;
+        let data = &txn.data[start..stop];
+        hash.push(hash_account(&account.key, data));
+    }
+
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -288,4 +310,63 @@ fn main() {
         w.join().unwrap();
     }
     stats_thread.join().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use crate::{Config, Transaction, hash_account, hash_transaction, make_transaction};
+
+    struct Account {
+        key: [u8; 32],
+        data: Vec<u8>,
+    }
+
+    struct Txn {
+        created_at: Instant,
+        accounts: Vec<Account>,
+    }
+
+    #[test]
+    fn hash_account_match() {
+        let instant = Instant::now();
+        let counter = 1;
+        let txns = make_transaction(&Config::default(), counter);
+        let tx = Transaction {
+            created_at: instant,
+            accounts: txns.accounts,
+            data: txns.data,
+        };
+
+        let first_hashes = hash_transaction(&tx);
+
+        let accounts = (0..Config::default().accounts)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&counter.to_le_bytes());
+                key[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+
+                Account {
+                    key,
+                    data: vec![
+                        (counter as u8).wrapping_add(i as u8);
+                        Config::default().account_size
+                    ],
+                }
+            })
+            .collect();
+
+        let old_tx = Txn {
+            created_at: instant,
+            accounts,
+        };
+
+        let mut second_hashes: Vec<blake3::Hash> = Vec::with_capacity(old_tx.accounts.len());
+        for account in old_tx.accounts {
+            second_hashes.push(hash_account(&account.key, &account.data));
+        }
+
+        assert_eq!(first_hashes, second_hashes)
+    }
 }
