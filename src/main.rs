@@ -37,6 +37,7 @@ struct Config {
     account_size: usize,
     rate: u64,
     queue: usize,
+    batch: usize,
 }
 
 impl Config {
@@ -49,6 +50,7 @@ impl Config {
             account_size: 256,
             rate: 20_000,
             queue: 10_000,
+            batch: 1
         }
     }
 
@@ -71,6 +73,7 @@ impl Config {
                 "--account-size" => cfg.account_size = value() as usize,
                 "--rate" => cfg.rate = value(),
                 "--queue" => cfg.queue = value() as usize,
+                "--batch" => cfg.batch = value() as usize,
                 other => panic!("unknown option: {other}"),
             }
             i += 2;
@@ -128,25 +131,32 @@ fn make_transaction(cfg: &Config, counter: u64) -> Transaction {
     }
 }
 
-fn producer(cfg: Config, tx: Sender<Transaction>, stop_at: Instant) {
+fn producer(cfg: Config, tx: Sender<Vec<Transaction>>, stop_at: Instant) {
+// fn producer(cfg: Config, tx: Sender<Transaction>, stop_at: Instant) {
     let mut counter = 0u64;
 
     // Pacing: produce in small batches, then sleep until the next batch is due.
     // (Sleeping per transaction would be too coarse at high rates.)
-    let batch = 100u64;
+    // let batch = 100u64;
+    let batch_per_send = cfg.batch;
     let batch_interval = if cfg.rate == 0 {
         None
     } else {
-        Some(Duration::from_secs_f64(batch as f64 / cfg.rate as f64))
+        Some(Duration::from_secs_f64(batch_per_send as f64 / cfg.rate as f64))
     };
     let mut next_batch = Instant::now();
 
+    
     while Instant::now() < stop_at {
-        for _ in 0..batch {
-            if tx.send(make_transaction(&cfg, counter)).is_err() {
-                return;
-            }
+        let mut txs: Vec<Transaction> = Vec::with_capacity(batch_per_send as usize);
+        for _ in 0..batch_per_send {
+            txs.push(make_transaction(&cfg, counter));
+
             counter += 1;
+        }
+
+        if tx.send(txs).is_err() {
+            return
         }
 
         if let Some(interval) = batch_interval {
@@ -170,17 +180,20 @@ fn hash_account(key: &[u8], data: &[u8]) -> blake3::Hash {
     hasher.finalize()
 }
 
-fn worker(rx: Receiver<Transaction>, reports: Sender<Report>) {
+fn worker(rx: Receiver<Vec<Transaction>>, reports: Sender<Report>) {
     let mut latencies = Vec::with_capacity(4096);
     let mut last_flush = Instant::now();
     let mut checksum = 0u8; // keeps the compiler from optimizing hashing away
 
-    for txn in rx {
-        for hash in hash_transaction(&txn) {
-            checksum ^= hash.as_bytes()[0]
+    for txns in rx {
+        for txn in txns {
+            for hash in hash_transaction(&txn) {
+                checksum ^= hash.as_bytes()[0]
+            }
+
+            latencies.push(txn.created_at.elapsed().as_micros() as u64);
         }
 
-        latencies.push(txn.created_at.elapsed().as_micros() as u64);
 
         // Send latencies to the reporter in batches, not one by one.
         if latencies.len() >= 4096 || last_flush.elapsed() >= Duration::from_millis(100) {
@@ -266,7 +279,7 @@ fn main() {
     let cfg = Config::from_args();
     println!("{cfg:?}");
 
-    let (txn_tx, txn_rx) = bounded::<Transaction>(cfg.queue);
+    let (txn_tx, txn_rx) = bounded::<Vec<Transaction>>(cfg.queue);
     let (report_tx, report_rx) = bounded::<Report>(1024);
     let stop_at = Instant::now() + Duration::from_secs(cfg.seconds);
 
