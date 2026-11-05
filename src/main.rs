@@ -24,9 +24,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use hdrhistogram::Histogram;
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -244,31 +248,52 @@ fn print_line(label: &str, latencies: &mut Vec<u64>, elapsed: Duration) {
     );
 }
 
+fn print_hist(label: &str, h: &Histogram<u64>, elapsed: Duration) {
+    let per_sec = h.len() as f64 / elapsed.as_secs_f64();
+    println!(
+        "{label:>6}  {per_sec:>10.0} tx/s   latency p50 {:>6}µs   p99 {:>6}µs   max {:>7}µs",
+        h.value_at_quantile(0.50),
+        h.value_at_quantile(0.99),
+        h.max(),
+    );
+}
+
 fn stats(reports: Receiver<Report>) {
     let start = Instant::now();
-    let mut window = Vec::new();
-    let mut all = Vec::new();
+    let mut window = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let mut all = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
     let mut window_start = Instant::now();
     let mut second = 1;
 
     loop {
         match reports.recv_timeout(Duration::from_millis(50)) {
-            Ok(report) => window.extend(report.latencies_us),
+            Ok(report) => {
+                for v in report.latencies_us {
+                    window.saturating_record(v);
+                }
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
         if window_start.elapsed() >= Duration::from_secs(1) {
-            print_line(&format!("{second}s"), &mut window, window_start.elapsed());
-            all.append(&mut window);
+            print_hist(&format!("{second}s"), &window, window_start.elapsed());
+            all.add(&window).unwrap();
+            window.reset();
             window_start = Instant::now();
             second += 1;
         }
     }
 
-    all.append(&mut window);
+    all.add(&window).unwrap();
     println!("{}", "-".repeat(78));
-    print_line("total", &mut all, start.elapsed());
+    print_hist("total", &all, start.elapsed());
+}
+
+#[cfg(target_os = "macos")]
+fn set_qos(class: libc::qos_class_t) {
+    let rc = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+    assert_eq!(rc, 0, "failed to set QoS");
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +319,11 @@ fn main() {
             let reports = report_tx.clone();
             thread::Builder::new()
                 .name(format!("worker-{i}"))
-                .spawn(move || worker(rx, reports))
+                .spawn(move || {
+                    // #[cfg(target_os = "macos")]
+                    // set_qos(libc::qos_class_t::QOS_CLASS_BACKGROUND); // should puhs it to the efficiency cores
+                    worker(rx, reports)
+                })
                 .unwrap()
         })
         .collect();

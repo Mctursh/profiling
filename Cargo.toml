@@ -7,6 +7,9 @@ edition = "2024"
 blake3 = { version = "1.8.7" }
 # blake3 = { version = "1.8.7", features = ["no_neon"] }
 crossbeam-channel = "0.5.17"
+hdrhistogram = "7.6.0"
+libc = "0.2.191"
+mimalloc = "0.1.52"
 
 # Keep optimizations on, but also keep debug symbols so profilers can show
 # real function names instead of raw addresses.
