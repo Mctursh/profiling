@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 blake3 = { version = "1.8.7" }
+core_affinity = "0.8.3"
 # blake3 = { version = "1.8.7", features = ["no_neon"] }
 crossbeam-channel = "0.5.17"
 hdrhistogram = "7.6.0"

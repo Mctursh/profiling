@@ -42,6 +42,8 @@ struct Config {
     rate: u64,
     queue: usize,
     batch: usize,
+    worker_cpus: Option<Vec<usize>>,
+    producer_cpus: Option<Vec<usize>>,
 }
 
 impl Config {
@@ -54,7 +56,9 @@ impl Config {
             account_size: 256,
             rate: 20_000,
             queue: 10_000,
-            batch: 1
+            batch: 1,
+            worker_cpus: None,
+            producer_cpus: None,
         }
     }
 
@@ -69,6 +73,28 @@ impl Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| panic!("{} needs a number", args[i]))
             };
+
+            let range = || -> Option<Vec<usize>> {
+                Some(
+                    args.get(i + 1)
+                        .and_then(|v| {
+                            let val = v.split("-").collect::<Vec<&str>>();
+                            if val.len() != 2 {
+                                panic!("{} needs to be a range eg. 0-5", args[i])
+                            }
+                            let val = val
+                                .into_iter()
+                                .map(|v| v.parse::<usize>().unwrap())
+                                .collect::<Vec<usize>>();
+                            let start = val[0];
+                            let end = val[1];
+                            assert!(start > end, "invalid range, start is higher than end");
+                            Some((start..=end).collect::<Vec<usize>>())
+                        })
+                        .unwrap_or_else(|| panic!("{} needs a number", args[i])),
+                )
+            };
+
             match args[i].as_str() {
                 "--seconds" => cfg.seconds = value(),
                 "--producers" => cfg.producers = value() as usize,
@@ -78,6 +104,8 @@ impl Config {
                 "--rate" => cfg.rate = value(),
                 "--queue" => cfg.queue = value() as usize,
                 "--batch" => cfg.batch = value() as usize,
+                "--worker-cpus" => cfg.worker_cpus = range(),
+                "--producer-cpus" => cfg.producer_cpus = range(),
                 other => panic!("unknown option: {other}"),
             }
             i += 2;
@@ -122,9 +150,7 @@ fn make_transaction(cfg: &Config, counter: u64) -> Transaction {
                 txs_data.len() + cfg.account_size,
                 (counter as u8).wrapping_add(i as u8),
             );
-            Account {
-                key,
-            }
+            Account { key }
         })
         .collect();
 
@@ -136,7 +162,7 @@ fn make_transaction(cfg: &Config, counter: u64) -> Transaction {
 }
 
 fn producer(cfg: Config, tx: Sender<Vec<Transaction>>, stop_at: Instant) {
-// fn producer(cfg: Config, tx: Sender<Transaction>, stop_at: Instant) {
+    // fn producer(cfg: Config, tx: Sender<Transaction>, stop_at: Instant) {
     let mut counter = 0u64;
 
     // Pacing: produce in small batches, then sleep until the next batch is due.
@@ -146,11 +172,12 @@ fn producer(cfg: Config, tx: Sender<Vec<Transaction>>, stop_at: Instant) {
     let batch_interval = if cfg.rate == 0 {
         None
     } else {
-        Some(Duration::from_secs_f64(batch_per_send as f64 / cfg.rate as f64))
+        Some(Duration::from_secs_f64(
+            batch_per_send as f64 / cfg.rate as f64,
+        ))
     };
     let mut next_batch = Instant::now();
 
-    
     while Instant::now() < stop_at {
         let mut txs: Vec<Transaction> = Vec::with_capacity(batch_per_send as usize);
         for _ in 0..batch_per_send {
@@ -160,7 +187,7 @@ fn producer(cfg: Config, tx: Sender<Vec<Transaction>>, stop_at: Instant) {
         }
 
         if tx.send(txs).is_err() {
-            return
+            return;
         }
 
         if let Some(interval) = batch_interval {
@@ -198,7 +225,6 @@ fn worker(rx: Receiver<Vec<Transaction>>, reports: Sender<Report>) {
             latencies.push(txn.created_at.elapsed().as_micros() as u64);
         }
 
-
         // Send latencies to the reporter in batches, not one by one.
         if latencies.len() >= 4096 || last_flush.elapsed() >= Duration::from_millis(100) {
             let _ = reports.send(Report {
@@ -220,7 +246,7 @@ fn hash_transaction(txn: &Transaction) -> impl Iterator<Item = blake3::Hash> {
         let start = (i * account_size) as usize;
         let stop = (start + account_size) as usize;
         let data = &txn.data[start..stop];
-       hash_account(&txn.accounts[i].key, data)
+        hash_account(&txn.accounts[i].key, data)
     })
 }
 
@@ -296,6 +322,17 @@ fn set_qos(class: libc::qos_class_t) {
     assert_eq!(rc, 0, "failed to set QoS");
 }
 
+fn pin(cpus: Option<Vec<usize>>, thread_index: usize) -> Option<bool> {
+    if let Some(worker_cpus) = cpus {
+        let cpu_list_index = thread_index % worker_cpus.len();
+        Some(core_affinity::set_for_current(core_affinity::CoreId {
+            id: worker_cpus[cpu_list_index],
+        }))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
@@ -315,11 +352,19 @@ fn main() {
 
     let workers: Vec<_> = (0..cfg.workers)
         .map(|i| {
+            let cfg = cfg.clone();
             let rx = txn_rx.clone();
             let reports = report_tx.clone();
             thread::Builder::new()
                 .name(format!("worker-{i}"))
                 .spawn(move || {
+                    if let Some(v) = pin(cfg.worker_cpus.clone(), i) {
+                        if v {
+                            println!("Successfully pinned worker-{i} to a core")
+                        } else {
+                            println!("Failed to pin worker-{i} to a core")
+                        }
+                    }
                     // #[cfg(target_os = "macos")]
                     // set_qos(libc::qos_class_t::QOS_CLASS_BACKGROUND); // should puhs it to the efficiency cores
                     worker(rx, reports)
@@ -333,10 +378,22 @@ fn main() {
     let producers: Vec<_> = (0..cfg.producers)
         .map(|i| {
             let tx = txn_tx.clone();
+            let producer_cpus = cfg.producer_cpus.clone();
             let cfg = cfg.clone();
             thread::Builder::new()
                 .name(format!("producer-{i}"))
-                .spawn(move || producer(cfg, tx, stop_at))
+                .spawn(move || {
+                    if let Some(v) = pin(producer_cpus, i) {
+                        if v {
+                            println!("Successfully pinned producer-{i} to a core")
+                        } else {
+                            println!("Failed to pin producer-{i} to a core")
+                        }
+                    }
+                    // #[cfg(target_os = "macos")]
+                    // set_qos(libc::qos_class_t::QOS_CLASS_BACKGROUND); // should puhs it to the efficiency cores
+                    producer(cfg, tx, stop_at)
+                })
                 .unwrap()
         })
         .collect();
