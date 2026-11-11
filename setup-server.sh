@@ -150,10 +150,10 @@ as_user 'cd ~/profiling-lab && cargo build --release'
 if [[ -n "$ISOLATE" ]]; then
   step "Reserving CPUs $ISOLATE (isolcpus, nohz_full, rcu_nocbs)"
   ARGS="isolcpus=$ISOLATE nohz_full=$ISOLATE rcu_nocbs=$ISOLATE"
-  GRUB=/etc/default/grub
-  # drop any earlier isolation args, then add the new ones
-  sed -i -E 's/ ?(isolcpus|nohz_full|rcu_nocbs)=[^" ]*//g' "$GRUB"
-  sed -i -E "s/^(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*)\"/\1 $ARGS\"/" "$GRUB"
+  # Provider images override /etc/default/grub with files in grub.d (Cherry's
+  # 99-cherry.cfg blanks the cmdline), so add our own file that sorts last.
+  sed -i -E 's/ ?(isolcpus|nohz_full|rcu_nocbs)=[^" ]*//g' /etc/default/grub
+  echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ARGS\"" > /etc/default/grub.d/99-zz-isolate.cfg
   update-grub
   NEED_REBOOT=1
 fi
