@@ -88,7 +88,7 @@ impl Config {
                                 .collect::<Vec<usize>>();
                             let start = val[0];
                             let end = val[1];
-                            assert!(start > end, "invalid range, start is higher than end");
+                            assert!(start <= end, "invalid range, start is higher than end");
                             Some((start..=end).collect::<Vec<usize>>())
                         })
                         .unwrap_or_else(|| panic!("{} needs a number", args[i])),
